@@ -28,7 +28,7 @@ jobs:
           test -x Mailspring.app/Contents/MacOS/Mailspring
           test -s Mailspring.app/Contents/Resources/app.asar
           test -x Mailspring.app/Contents/Resources/app.asar.unpacked/mailsync
-          lipo -verify_arch arm64 Mailspring.app/Contents/MacOS/Mailspring
+          lipo Mailspring.app/Contents/MacOS/Mailspring -verify_arch arm64
           codesign --force --deep --sign - Mailspring.app
           codesign --verify --deep --strict Mailspring.app
           ditto -c -k --keepParent Mailspring.app ../Mailspring-AppleSilicon.zip
