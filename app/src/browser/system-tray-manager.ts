@@ -1,5 +1,5 @@
 import path from 'path';
-import { app, Tray, Menu, nativeImage, NativeImage, nativeTheme } from 'electron';
+import { app, BrowserWindow, Tray, Menu, nativeImage, NativeImage, nativeTheme } from 'electron';
 import { localized } from '../intl';
 import { waitForStatusNotifierHost } from './sni-host';
 import Application from './application';
@@ -76,14 +76,44 @@ class SystemTrayManager {
     this._application = application;
     this.initTray();
 
+    if (platform === 'darwin') {
+      const watchWindow = (win: BrowserWindow) => {
+        win.on('show', this._updateDock);
+        win.on('hide', this._updateDock);
+        win.on('closed', this._updateDock);
+      };
+      BrowserWindow.getAllWindows().forEach(watchWindow);
+      app.on('browser-window-created', (_event, win) => {
+        watchWindow(win);
+        this._updateDock();
+      });
+      this._updateDock();
+    }
+
     this._application.config.onDidChange('core.workspace.systemTray', ({ newValue }) => {
       if (newValue === false) {
         this.destroyTray();
       } else {
         this.initTray();
       }
+      if (platform === 'darwin') this._updateDock();
     });
   }
+
+  // Read the final window state after Electron finishes dispatching the event.
+  _updateDock = () => {
+    setImmediate(() => {
+      if (this._application.isQuitting() || !app.dock) return;
+      const needsDock =
+        !this._tray ||
+        BrowserWindow.getAllWindows().some(win => win.isVisible() || win.isMinimized());
+      if (needsDock && !app.dock.isVisible()) {
+        void app.dock.show();
+      } else if (!needsDock && app.dock.isVisible()) {
+        app.dock.hide();
+      }
+    });
+  };
 
   _defaultIconPath() {
     if (this._platform !== 'linux') return null;

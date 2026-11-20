@@ -17,7 +17,6 @@ import {
 import fs from 'fs';
 import url from 'url';
 import path from 'path';
-import proc from 'child_process';
 import { EventEmitter } from 'events';
 
 import { localized, initializeLocalization } from '../intl';
@@ -177,7 +176,6 @@ export default class Application extends EventEmitter {
     }
 
     await this.oneTimeMoveToApplications();
-    await this.oneTimeAddToDock();
 
     guardAuxiliaryWindowNavigation();
     this.autoUpdateManager = new AutoUpdateManager(version, config, specMode);
@@ -300,21 +298,6 @@ export default class Application extends EventEmitter {
     }
     this.config.set('askedAboutAppMove', true);
     moveToApplications();
-  }
-
-  async oneTimeAddToDock() {
-    if (process.platform !== 'darwin') {
-      return;
-    }
-    const addedToDock = this.config.get('addedToDock');
-    const appPath = process.argv[0];
-    if (!addedToDock && appPath.includes('/Applications/') && appPath.includes('.app/')) {
-      const appBundlePath = appPath.split('.app/')[0];
-      proc.exec(
-        `defaults write com.apple.dock persistent-apps -array-add "<dict><key>tile-type</key><string>file-tile</string><key>tile-data</key><dict><key>file-type</key><integer>41</integer><key>file-label</key><string>Mailspring</string><key>bundle-identifier</key><string>com.mailspring.mailspring</string><key>file-data</key><dict><key>_CFURLString</key><string>file://${appBundlePath}.app/</string><key>_CFURLStringType</key><integer>15</integer></dict></dict></dict>" && pkill "Dock"`
-      );
-      this.config.set('addedToDock', true);
-    }
   }
 
   // On Windows, removing a file can fail if a process still has it open. When

@@ -1,0 +1,40 @@
+name: Personal macOS build
+
+on:
+  push:
+    branches: [macos/background-dock]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Verify and archive the Apple silicon app
+        working-directory: app/dist/Mailspring-darwin-arm64
+        run: |
+          set -euo pipefail
+          test -x Mailspring.app/Contents/MacOS/Mailspring
+          test -s Mailspring.app/Contents/Resources/app.asar
+          test -x Mailspring.app/Contents/Resources/app.asar.unpacked/mailsync
+          lipo -verify_arch arm64 Mailspring.app/Contents/MacOS/Mailspring
+          codesign --force --deep --sign - Mailspring.app
+          codesign --verify --deep --strict Mailspring.app
+          ditto -c -k --keepParent Mailspring.app ../Mailspring-AppleSilicon.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mailspring-AppleSilicon
+          path: app/dist/Mailspring-AppleSilicon.zip
+          if-no-files-found: error
+          compression-level: 0
