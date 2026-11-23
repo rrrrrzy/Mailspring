@@ -14,6 +14,22 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - name: Build patched Mailspring-Sync
+        run: |
+          git -C mailsync apply --check ../scripts/mailsync-unread-retry.patch
+          git -C mailsync apply ../scripts/mailsync-unread-retry.patch
+          SIGN_BUILD=false ./mailsync/build.sh
+          lipo app/mailsync -verify_arch arm64
+          shasum -a 256 app/mailsync | cut -d ' ' -f 1 > "$RUNNER_TEMP/mailsync.sha256"
+      - name: Test IMAP read-state retries
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mailsync-tests"
+          "$RUNNER_TEMP/mailsync-tests/bin/pip" install -r mailsync/test/requirements.txt
+          cd mailsync
+          "$RUNNER_TEMP/mailsync-tests/bin/python" test/run.py test/scenarios/unread-write-retry.yaml --server fake:netease-coremail --mailsync "$GITHUB_WORKSPACE/app/mailsync"
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -29,6 +45,7 @@ jobs:
           test -s Mailspring.app/Contents/Resources/app.asar
           test -x Mailspring.app/Contents/Resources/app.asar.unpacked/mailsync
           lipo Mailspring.app/Contents/MacOS/Mailspring -verify_arch arm64
+          test "$(shasum -a 256 Mailspring.app/Contents/Resources/app.asar.unpacked/mailsync | cut -d ' ' -f 1)" = "$(cat "$RUNNER_TEMP/mailsync.sha256")"
           codesign --force --deep --sign - Mailspring.app
           codesign --verify --deep --strict Mailspring.app
           ditto -c -k --keepParent Mailspring.app ../Mailspring-AppleSilicon.zip

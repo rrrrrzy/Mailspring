@@ -1,0 +1,168 @@
+diff --git a/MailSync/TaskProcessor.cpp b/MailSync/TaskProcessor.cpp
+index e0e462f..48d3464 100644
+--- a/MailSync/TaskProcessor.cpp
++++ b/MailSync/TaskProcessor.cpp
+@@ -414,10 +414,34 @@ void _applyUnreadInIMAPFolder(IMAPSession * session, MailStore * store, string a
+     ErrorCode err = ErrorCode::ErrorNone;
+     String * path = AS_MCSTR(source.path());
+     IndexSet * uids = _uidsOf(items);
+-    if (data["unread"].get<bool>() == false) {
+-        session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindAdd, MessageFlagSeen, &err);
+-    } else {
+-        session->storeFlagsByUID(path, uids, IMAPStoreFlagsRequestKindRemove, MessageFlagSeen, &err);
++    const auto kind = data["unread"].get<bool>() ? IMAPStoreFlagsRequestKindRemove : IMAPStoreFlagsRequestKindAdd;
++    session->storeFlagsByUID(path, uids, kind, MessageFlagSeen, &err);
++    constexpr int maxRetries = 3;
++    for (int retry = 1; err == ErrorCode::ErrorConnection && retry <= maxRetries; ++retry) {
++        auto logger = spdlog::get("logger");
++        logger->info("ChangeUnreadTask retry {}/{}: reconnecting after ErrorConnection", retry, maxRetries);
++        session->disconnect();
++        session->selectIfNeeded(path, &err);
++        if (err != ErrorCode::ErrorNone) {
++            auto error = SyncException(err, "reselect before storeFlagsByUID");
++            logger->warn("ChangeUnreadTask retry {}/{}: select failed ({})", retry, maxRetries, error.key);
++            if (err != ErrorCode::ErrorConnection || retry == maxRetries) {
++                throw error;
++            }
++            continue;
++        }
++
++        const auto & status = source.localStatus();
++        const auto uidValidity = status.find(LS_UIDVALIDITY);
++        if (uidValidity == status.end() || !uidValidity->is_number_integer() ||
++            session->uidValidity() == 0 || *uidValidity != session->uidValidity()) {
++            logger->warn("ChangeUnreadTask retry {}/{}: UIDVALIDITY unavailable or changed", retry, maxRetries);
++            throw SyncException("uidvalidity-changed", "reselect before storeFlagsByUID", false);
++        }
++
++        session->storeFlagsByUID(path, uids, kind, MessageFlagSeen, &err);
++        const auto result = err == ErrorCode::ErrorNone ? "success" : SyncException(err, "").key;
++        logger->info("ChangeUnreadTask retry {}/{}: STORE {}", retry, maxRetries, result);
+     }
+     if (err != ErrorCode::ErrorNone) {
+         throw SyncException(err, "storeFlagsByUID");
+diff --git a/test/fakeimap/server.py b/test/fakeimap/server.py
+index a866eb5..d736734 100644
+--- a/test/fakeimap/server.py
++++ b/test/fakeimap/server.py
+@@ -312,6 +312,8 @@ class Session(socketserver.StreamRequestHandler):
+             uid_mode = True
+         self.commands.append(cmd)
+         self.srv.fire("before_command", self, cmd, args.rest())
++        if self.closed:
++            return False
+         if self.desynced:
+             self.send(tag + b" BAD [CLIENTBUG] Command is not a valid IMAP command")
+             return True
+@@ -912,6 +914,9 @@ class Session(socketserver.StreamRequestHandler):
+             changed = self.store.set_labels(self.selected, uids, op, [v.strip('"') for v in value], origin=self)
+         else:
+             changed = self.store.store_flags(self.selected, uids, op, value, origin=self)
++        self.srv.fire("before_store_reply", self, "UID STORE" if uid_mode else "STORE", str(spec).encode())
++        if self.closed:
++            return False
+         for m in changed:
+             u = mb.view_uid(m) if isinstance(mb, LabelView) else m.uid
+             if u not in self.view:
+diff --git a/test/harness/scenario.py b/test/harness/scenario.py
+index f89b115..c3d9bad 100644
+--- a/test/harness/scenario.py
++++ b/test/harness/scenario.py
+@@ -515,6 +515,11 @@ class ScenarioRun:
+                            f"server.{op} {json.dumps(arg)}")
+                 if op == "reject":   # `close: true` ends the session after the NO, as a server does after a rejected login
+                     session.reject_next = (arg.get("code"), arg.get("text", "Command failed."), bool(arg.get("close")))
++                elif op == "drop_session":
++                    if "uidvalidity" in arg:
++                        self.server.set_uidvalidity(session.selected, int(arg["uidvalidity"]))
++                    session.connection.shutdown(2)
++                    session.closed = True
+                 elif op == "desync":
+                     session.desynced = True
+                 elif op == "garble":
+diff --git a/test/harness/servers/fake.py b/test/harness/servers/fake.py
+index aa2c4b9..2455641 100644
+--- a/test/harness/servers/fake.py
++++ b/test/harness/servers/fake.py
+@@ -205,7 +205,7 @@ class FakeServer(Server):
+ 
+     # fake-only scripting
+     def at(self, hook: str, fn, once: bool = True, session: Optional[str] = None,
+-           command: Optional[str] = None, mailbox: Optional[str] = None, nth: int = 1):
++           command: Optional[str] = None, mailbox: Optional[str] = None, nth: int = 1, times: Optional[int] = None):
+         """Run fn(session) at a protocol moment: idle_start, idle_tick, before_fetch_body,
+         before_command, after_command. Filters narrow which occasion counts: `session` is
+         "foreground" (a connection that has idled - the engine's IDLE worker) or "background"
+@@ -232,7 +232,7 @@ class FakeServer(Server):
+                 if not rx.search(line):
+                     return False
+             seen[0] += 1
+-            if seen[0] < nth:
++            if seen[0] < nth or (times is not None and seen[0] >= nth + times):
+                 return False
+             if once and not claim.acquire(blocking=False):
+                 return False
+diff --git a/test/scenarios/unread-write-retry.yaml b/test/scenarios/unread-write-retry.yaml
+new file mode 100644
+index 0000000..3793176
+--- /dev/null
++++ b/test/scenarios/unread-write-retry.yaml
+@@ -0,0 +1,58 @@
++name: unread-write-retry
++description: Retry only connection failures writing Seen, with at most three reconnects per folder.
++servers:
++  - {fake: netease-coremail}
++mailboxes:
++  INBOX: {messages: 6}
++steps:
++  - wait: quiescent
++  - client.task: {__cls: ChangeUnreadTask, messages: {mailbox: INBOX, uids: [1]}, unread: true}
++    as: first
++  - wait: {task: first, timeout: 30}
++  - wait: quiescent
++  - server.flags: {mailbox: INBOX, uids: [2], remove: ["\\Seen"]}
++  - sync: pass
++  - server.drop_session: {at: {hook: before_command, command: "^UID STORE 2 ", every: true, times: 3}}
++  - client.task: {__cls: ChangeUnreadTask, messages: {mailbox: INBOX, uids: [2]}, unread: false}
++    as: third_retry
++  - wait: {task: third_retry, timeout: 30}
++  - wait: quiescent
++  - server.drop_session: {at: {hook: before_command, command: "^UID STORE 3 ", every: true}}
++  - client.task: {__cls: ChangeUnreadTask, messages: {mailbox: INBOX, uids: [3]}, unread: true}
++    as: exhausted
++  - wait: {task: exhausted, timeout: 30}
++  - wait: quiescent
++  - server.reject: {at: {hook: before_command, command: "^UID STORE 4 "}, code: NOPERM}
++  - client.task: {__cls: ChangeUnreadTask, messages: {mailbox: INBOX, uids: [4]}, unread: true}
++    as: rejected
++  - wait: {task: rejected, timeout: 30}
++  - wait: quiescent
++  - server.drop_session: {at: {hook: before_store_reply, command: "^UID STORE 5$"}}
++  - client.task: {__cls: ChangeUnreadTask, messages: {mailbox: INBOX, uids: [5]}, unread: true}
++    as: lost_ack
++  - wait: {task: lost_ack, timeout: 30}
++  - wait: quiescent
++  - server.drop_session: {uidvalidity: 987654, at: {hook: before_command, command: "^UID STORE 6 "}}
++  - client.task: {__cls: ChangeUnreadTask, messages: {mailbox: INBOX, uids: [6]}, unread: true}
++    as: new_uid_epoch
++  - wait: {task: new_uid_epoch, timeout: 30}
++  - wait: quiescent
++  - sync: pass
++expect:
++  task_error: {first: null, third_retry: null, exhausted: ErrorConnection, rejected: ErrorStore, lost_ack: null, new_uid_epoch: uidvalidity-changed}
++  log_count:
++    'ChangeUnreadTask retry \d/3: reconnecting': 8
++    'ChangeUnreadTask retry 3/3: STORE success': 1
++    'ChangeUnreadTask retry 3/3: STORE ErrorConnection': 1
++    'ChangeUnreadTask retry 1/3: STORE success': 1
++    'UIDVALIDITY unavailable or changed': 1
++  server_has:
++    INBOX:
++      - {message_id: "harness-1-ca3b8317@example.test", flags: []}
++      - {message_id: "harness-2-bc98605c@example.test", flags: ["\\Seen"]}
++      - {message_id: "harness-3-e480dd9e@example.test", flags: ["\\Seen"]}
++      - {message_id: "harness-4-79f05e78@example.test", flags: ["\\Seen"]}
++      - {message_id: "harness-5-1c6f3d22@example.test", flags: []}
++      - {message_id: "harness-6-07e703cf@example.test", flags: ["\\Seen"]}
++  db_matches_server: {}
++  running: true
